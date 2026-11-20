@@ -38,7 +38,7 @@ class MonaiServerREST:
         download_uri = f"{self.serverUrl}/datastore/?output=all"
 
         try:
-            response = requests.get(download_uri, timeout=5)
+            response = requests.get(download_uri, timeout=60)
         except Exception as exception:
             logging.warning(f"{self.getCurrentTime()}: Request for DataStoreInfo failed due to '{exception}'")
             return None
@@ -64,7 +64,7 @@ class MonaiServerREST:
         logging.info(f"{self.getCurrentTime()}: REST: request segmentation '{download_uri}'")
 
         try:
-            response = requests.get(download_uri, timeout=5)
+            response = requests.get(download_uri, timeout=60)
         except Exception as exception:
             logging.warning(
                 "{}: Segmentation request (image id: '{}') failed due to '{}'".format(
@@ -72,10 +72,10 @@ class MonaiServerREST:
                 )
             )
             return None
-        if response.status_code != 200:
+        if response is None or response.status_code != 200:
             logging.warn(
                 "{}: Segmentation request (image id: '{}') failed due to response code: '{}'".format(
-                    self.getCurrentTime(), image_id, response.status_code
+                    self.getCurrentTime(), image_id, getattr(response, "status_code", None)
                 )
             )
             return None

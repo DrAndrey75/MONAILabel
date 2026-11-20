@@ -106,7 +106,10 @@ class ImageDataExtractor:
         returns percentage of already segmented images out of all available images
         """
         segmentedCount = self.getNumOfSegmented()
-        float_Num = segmentedCount / self.getTotalNumImages()
+        total = self.getTotalNumImages()
+        if total == 0:
+            return 0
+        float_Num = segmentedCount / total
         return int(float_Num * 100)
 
     def getSegmentationVsTotalStr(self) -> str:
@@ -122,7 +125,10 @@ class ImageDataExtractor:
         returns percentage of already approved imageData out of all available imageData
         """
         approvalCount = self.getNumApprovedSegmentation()
-        fraction = approvalCount / self.getTotalNumImages()
+        total = self.getTotalNumImages()
+        if total == 0:
+            return 0
+        fraction = approvalCount / total
         return int(fraction * 100)
 
     def getApprovalVsTotal(self) -> str:

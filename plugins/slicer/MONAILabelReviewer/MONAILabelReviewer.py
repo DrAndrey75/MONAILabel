@@ -14,9 +14,14 @@ import logging
 import os
 import re
 import tempfile
+import threading
+import time
+import traceback
 from typing import Dict, List
 
 import qt
+import vtk
+import vtkSegmentationCore
 import requests
 import SampleData
 import slicer
@@ -25,6 +30,13 @@ from MONAILabelReviewerLib.ImageDataController import ImageDataController, Image
 from MONAILabelReviewerLib.MONAILabelReviewerEnum import Label, Level, SegStatus
 from slicer.ScriptedLoadableModule import *
 from slicer.util import VTKObservationMixin
+
+
+class Reviewer:
+    """Local reviewer selection policy for the Slicer UI."""
+
+    NON_HUMAN_REVIEWERS = {""}
+    DEFAULT_REVIEWER = "Neuro"
 
 
 class MONAILabelReviewer(ScriptedLoadableModule):
@@ -81,7 +93,7 @@ class MONAILabelReviewerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
         self.LEVEL = Level()
         self.LABEL = Label()
 
-        self.selectedReviewer: str = ""
+        self.selectedReviewer: str = "Neuro"
         self.selectedClientId: str = ""
         self.currentImageId: str = ""
         self.currentLabelVersion: str = ""
@@ -98,6 +110,13 @@ class MONAILabelReviewerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
 
         self.reviewersModeIsActive = False
         self.isSelectableByLabelVersion = False
+        self._suppressUiSignals = False
+        self._connectionInProgress = False
+        self._connectionResult = None
+        self._connectionTimer = None
+        self._datastoreReady = False
+        self._seriesLoaded = False
+        self._connectionLogPath = os.path.join(tempfile.gettempdir(), "MONAILabelReviewer-connection.log")
 
         self.mapFiltersToBool: Dict[str, bool] = {
             "segmented": False,
@@ -117,6 +136,12 @@ class MONAILabelReviewerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
         uiWidget = slicer.util.loadUI(self.resourcePath("UI/MONAILabelReviewer.ui"))
         self.layout.addWidget(uiWidget)
         self.ui = slicer.util.childWidgetVariables(uiWidget)
+        # Bound the two expanding views inside Search Images. Without limits,
+        # opening the collapsible section repeatedly recalculates the parent
+        # layout and may consume all available memory in Slicer 5.12/Qt 5.
+        self.ui.tabWidget.setFixedHeight(220)
+        self.ui.textEdit_search.setFixedHeight(100)
+        self.ui.tableWidge_imageMeta.setFixedHeight(220)
 
         # Set scene in MRML widgets. Make sure that in Qt designer the top-level qMRMLWidget's
         # "mrmlSceneChanged(vtkMRMLScene*)" signal in is connected to each MRML widget's.
@@ -133,6 +158,19 @@ class MONAILabelReviewerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
         self.setLightVersion()
 
         self.ui.verticalLayout_10.addWidget(self.segmentEditorWidget)
+        self.segmentEditorWidget.hide()
+        self._lastSegmentationNode = None
+        self._loadedReviewMeta = None
+        self._segmentsTable = slicer.qMRMLSegmentsTableView()
+        self._segmentsTable.setMRMLScene(slicer.mrmlScene)
+        self._segmentsTable.setMinimumHeight(180)
+        self.ui.verticalLayout_10.addWidget(self._segmentsTable)
+        # 3D surfaces are an explicit, separate operation: building closed
+        # surfaces runs on the GUI thread and may take seconds per series.
+        self._build3DButton = qt.QPushButton("Показать 3D (построить поверхности)")
+        self._build3DButton.setToolTip("Строит closed-surface только для текущей серии. Маски не меняются.")
+        self._build3DButton.clicked.connect(self.onBuild3DSurfaces)
+        self.ui.verticalLayout_10.addWidget(self._build3DButton)
         self.loadServerSelection()
 
         #  Section: Widget Elements
@@ -220,16 +258,25 @@ class MONAILabelReviewerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
         Called when the application closes and the module widget is destroyed.
         """
         self.removeObservers()
+        if self._connectionTimer is not None:
+            self._connectionTimer.stop()
 
     def indexReviewerchanged(self, index):
         logging.info(f"{self.getCurrentTime()}: Selected reviewer: '{self.ui.comboBox_reviewers.currentText}'")
         self.selectedReviewer = self.ui.comboBox_reviewers.currentText
 
     def index_changed(self, index):
-        self.loadImageData()
+        if self._suppressUiSignals or self._connectionInProgress:
+            logging.debug(f"{self.getCurrentTime()}: Ignoring client selection signal during initialization")
+            return
+        # Choosing an annotator only changes the pending filter. Downloading
+        # the first MRI here froze Slicer for large Task04 data sets.
+        self._seriesLoaded = False
+        self.updateSectionAvailability()
+        self.setLoadButtonColor(reload=True)
 
     def indexLabelVersionChanged(self, index):
-        logging.warn(
+        logging.debug(
             f"{self.getCurrentTime()}: Selected labal version: '{self.getCurrentLabelVersionFromComboBox()}', is enabled '{self.isSelectableByLabelVersion}'"
         )
         self.displayAdditionalMetaIfEdited(self.getCurrentLabelVersionFromComboBox())
@@ -405,12 +452,16 @@ class MONAILabelReviewerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
         self.collapseAllSecions()
 
         self.activateSegmentatorEditor(activated=False)
-        self.hideEditingSelectionOption(isHidden=True)
+        # Basic mode also supports local label correction and adding segments.
+        # Reviewer-only filters and approval controls remain hidden.
+        self.hideEditingSelectionOption(isHidden=False)
 
     def cleanCache(self):
         self.logic = MONAILabelReviewerLogic()
-        self.selectedReviewer = ""
+        self.selectedReviewer = Reviewer.DEFAULT_REVIEWER
         self.selectedClientId = ""
+        self._datastoreReady = False
+        self._seriesLoaded = False
 
         self.listImageData = None
         self.imageCounter = 0
@@ -437,41 +488,116 @@ class MONAILabelReviewerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
         initiates connection to monai server
         Default: client listens on "http://127.0.0.1:8000"
         """
-        # Check Connection
+        if self._connectionInProgress:
+            return
+        self._connectionInProgress = True
+        try:
+            self._init_dicom_stream_impl()
+        except Exception:
+            self._logConnection("Connection setup failed: " + traceback.format_exc())
+            self._connectionInProgress = False
+            slicer.util.warningDisplay("Reviewer connection setup failed. See MONAILabelReviewer-connection.log in the temporary folder.")
+
+    def _logConnection(self, message):
+        line = f"{datetime.datetime.now().isoformat(timespec='milliseconds')} {message}"
+        logging.info("[Reviewer connection] %s", message)
+        try:
+            with open(self._connectionLogPath, "a", encoding="utf-8") as stream:
+                stream.write(line + "\n")
+        except OSError:
+            logging.exception("Cannot write Reviewer connection log")
+
+    def _init_dicom_stream_impl(self):
+        # Only the worker uses requests and parses the datastore. Slicer and Qt
+        # objects are accessed exclusively from the GUI thread in _finishConnection.
         self.cleanCache()
         serverUrl: str = self.ui.comboBox_server_url.currentText
-        isConnected: bool = self.logic.connectToMonaiServer(serverUrl)
-        if not isConnected:
-            warningMessage = f"Connection to server failed \ndue to invalid ip '{serverUrl}'"
-            slicer.util.warningDisplay(warningMessage)
+        self._connectionResult = None
+        self.ui.btn_connect_monai.enabled = False
+
+        def worker():
+            try:
+                started = time.monotonic()
+                controller = ImageDataController()
+                connected = controller.connectToMonaiServer(serverUrl)
+                if not connected:
+                    self._connectionResult = (False, "Server did not respond", None)
+                    return
+                started = time.monotonic()
+                loaded = controller.initMetaDataProcessing()
+                if not loaded:
+                    self._connectionResult = (False, "Datastore could not be read", None)
+                    return
+                started = time.monotonic()
+                statistics = controller.getStatistics()
+                clients = controller.getClientIds()
+                reviewers = controller.getReviewers()
+                self._connectionResult = (True, "", (controller, statistics, clients, reviewers))
+            except Exception:
+                error = traceback.format_exc()
+                self._logConnection("WORKER ERROR " + error)
+                self._connectionResult = (False, error, None)
+
+        self._connectionTimer = qt.QTimer()
+        self._connectionTimer.setInterval(100)
+        self._connectionTimer.timeout.connect(self._finishConnection)
+        self._connectionTimer.start()
+        threading.Thread(target=worker, name="ReviewerDatastore", daemon=True).start()
+
+    def _finishConnection(self):
+        result = self._connectionResult
+        if result is None:
             return
-        self.ui.btn_connect_monai.setStyleSheet(self.colorGreenButtonAfterSuccessfulLoad)
-        self.processDataStoreRecords()
-        self.initUI()
+        self._connectionTimer.stop()
+        self._connectionResult = None
+        try:
+            success, error, payload = result
+            if not success:
+                self._logConnection("FAILED " + error)
+                slicer.util.warningDisplay("Reviewer connection failed. See MONAILabelReviewer-connection.log in the temporary folder.")
+                return
+            controller, statistics, clients, reviewers = payload
+            self.logic.imageDataController = controller
+            self._datastoreReady = True
+            self._seriesLoaded = False
+            self.ui.btn_connect_monai.setStyleSheet(self.colorGreenButtonAfterSuccessfulLoad)
+            self.initUI(statistics=statistics, clients=clients, reviewers=reviewers)
+        except Exception:
+            self._logConnection("GUI ERROR " + traceback.format_exc())
+            slicer.util.warningDisplay("Reviewer GUI update failed. See MONAILabelReviewer-connection.log in the temporary folder.")
+        finally:
+            self.ui.btn_connect_monai.enabled = True
+            self._connectionInProgress = False
 
     def collapseAllSecions(self):
-        self.ui.collapsibleButton_search_image.enabled = False
-        self.ui.collapsibleButton_dicom_stream.enabled = False
-        self.ui.collapsibleButton_dicom_evaluation.enabled = False
-
         self.ui.collapsibleButton_search_image.collapsed = True
         self.ui.collapsibleButton_dicom_stream.collapsed = True
         self.ui.collapsibleButton_dicom_evaluation.collapsed = True
+        self.updateSectionAvailability()
 
-    def initUI(self):
-        self.selectedReviewer = self.ui.comboBox_reviewers.currentText
-        if self.reviewersModeIsActive and self.selectedReviewer == "":
-            warningMessage = "Missing reviewer's name.\nPlease enter your id or name in the reviewer's field!"
-            slicer.util.warningDisplay(warningMessage)
-            return
-        self.ui.collapsibleButton_search_image.enabled = True
-        self.ui.collapsibleButton_dicom_stream.enabled = True
+    def updateSectionAvailability(self):
+        """Keep mode switches from disabling an already connected session."""
+        datastoreReady = bool(getattr(self, "_datastoreReady", False))
+        seriesLoaded = bool(getattr(self, "_seriesLoaded", False))
+        self.ui.collapsibleButton_search_image.enabled = datastoreReady
+        self.ui.collapsibleButton_dicom_stream.enabled = datastoreReady
+        self.ui.collapsibleButton_dicom_evaluation.enabled = datastoreReady and seriesLoaded
+
+    def initUI(self, statistics=None, clients=None, reviewers=None):
+        self._datastoreReady = True
+        self.updateSectionAvailability()
 
         # set Segmentation progress bar
-        self.setProgessBar()
+        self.setProgessBar(statistics=statistics)
 
-        # fill combobox
-        self.fillComboBoxes()
+        # Prevent combo-box signals from starting image loading while the UI
+        # is still being populated.
+        self._suppressUiSignals = True
+        try:
+            self.fillComboBoxes(clients=clients, reviewers=reviewers)
+        finally:
+            self._suppressUiSignals = False
+        self.selectedReviewer = self.ui.comboBox_reviewers.currentText or Reviewer.DEFAULT_REVIEWER
 
         # set up buttons
         self.setButtons()
@@ -501,17 +627,32 @@ class MONAILabelReviewerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
 
         self.ui.btn_show_image.enabled = False
 
-    def setProgessBar(self):
-        statistics = self.logic.getStatistics()
+    def setProgessBar(self, statistics=None):
+        if statistics is None:
+            statistics = self.logic.getStatistics()
 
         self.ui.progressBar_segmentation.setProperty("value", statistics.getSegmentationProgress())
         self.ui.label_idx_seg_image.setText(statistics.getIdxTotalSegmented())
         self.ui.label_idx_appr_image.setText(statistics.getIdxTotalApproved())
         self.ui.progressBar_approved_total.setProperty("value", statistics.getProgressPercentage())
 
-    def fillComboBoxes(self):
+    def loadConfiguredReviewers(self):
+        """Compatibility hook for versions that support local reviewer config."""
+        return []
+
+    def mergeReviewers(self, fromDatastore=None):
+        """Put the local default first, then configured and datastore reviewers."""
+        if fromDatastore is None:
+            fromDatastore = self.logic.getReviewers()
+        merged = [Reviewer.DEFAULT_REVIEWER] + self.loadConfiguredReviewers() + list(fromDatastore)
+        return list(dict.fromkeys(
+            reviewer for reviewer in merged
+            if reviewer not in Reviewer.NON_HUMAN_REVIEWERS
+        ))
+
+    def fillComboBoxes(self, clients=None, reviewers=None):
         # clients
-        clientIds = self.logic.getClientIds()
+        clientIds = clients if clients is not None else self.logic.getClientIds()
 
         self.ui.comboBox_clients.clear()
         self.ui.comboBox_clients.addItem("All")
@@ -526,14 +667,12 @@ class MONAILabelReviewerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
 
         # reviewers
         self.ui.comboBox_reviewers.clear()
-        reviewers = self.logic.getReviewers()
-        self.ui.comboBox_reviewers.addItem(self.selectedReviewer)
-
-        for reviewer in reviewers:
-            if reviewer == self.selectedReviewer:
-                continue
-            self.ui.comboBox_reviewers.addItem(str(reviewer))
-        self.ui.comboBox_reviewers.setCurrentText(self.selectedReviewer)
+        reviewers = self.mergeReviewers(fromDatastore=reviewers)
+        self.ui.comboBox_reviewers.addItems([str(reviewer) for reviewer in reviewers])
+        defaultIndex = self.ui.comboBox_reviewers.findText(Reviewer.DEFAULT_REVIEWER)
+        if defaultIndex >= 0:
+            self.ui.comboBox_reviewers.setCurrentIndex(defaultIndex)
+        self.selectedReviewer = Reviewer.DEFAULT_REVIEWER
 
         # combobox in search section
         self.ui.comboBox_search_reviewer.clear()
@@ -558,8 +697,6 @@ class MONAILabelReviewerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
 
     # Section: Loading images
     def loadImageData(self):
-        if (self.selectedClientId == self.getSelectedClientFromComboBox()) and (self.isDifferentFilter() is False):
-            return
         self.imageCounter = 0
 
         self.cleanSearchSection()
@@ -583,12 +720,14 @@ class MONAILabelReviewerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
             )
         )
 
+        loaded = False
         if len(self.listImageData) > 0:
             self.currentImageData = self.listImageData[self.imageCounter]
-            self.loadNextImage(self.currentImageData)
+            loaded = self.loadNextImage(self.currentImageData)
 
-        self.ui.collapsibleButton_dicom_evaluation.enabled = True
-        self.ui.collapsibleButton_dicom_evaluation.collapsed = False
+        self.ui.collapsibleButton_dicom_evaluation.enabled = loaded
+        if loaded:
+            self.ui.collapsibleButton_dicom_evaluation.collapsed = False
         self.setHorizontalSlider(len(self.listImageData))
         self.collectFilters()
         self.setLoadButtonColor(reload=False)
@@ -641,8 +780,8 @@ class MONAILabelReviewerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
 
     def setHorizontalSlider(self, loadesImageCount: int):
         self.ui.horizontalSlider_image_idx.setMinimum(0)
-        self.ui.horizontalSlider_image_idx.setMaximum(loadesImageCount - 1)
-        idxImage = f"Image: {self.imageCounter + 1}/{len(self.listImageData)}"
+        self.ui.horizontalSlider_image_idx.setMaximum(max(0, loadesImageCount - 1))
+        idxImage = f"Image: {self.imageCounter + 1 if loadesImageCount else 0}/{loadesImageCount}"
         self.ui.label_idx_image.setText(idxImage)
 
     def updateHorizontalSlider(self):
@@ -726,6 +865,13 @@ class MONAILabelReviewerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
             self.ui.checkBox_not_segmented.setChecked(False)
 
     # Section: Search Image
+    def resetSearchSelection(self):
+        self.currentImageData = None
+        self.currentImageId = ""
+        self.imageCounter = 0
+        self.ui.collapsibleButton_dicom_evaluation.enabled = False
+        self.ui.btn_show_image.enabled = False
+
     def cleanSearchSection(self):
         self.ui.tableWidge_imageMeta.setRowCount(0)
         self.ui.tableWidge_imageMeta.clearContents()
@@ -736,6 +882,7 @@ class MONAILabelReviewerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
         After triggering search button, load images and segmentation by input ids
         """
         self.cleanDicomStreamSection()
+        self.resetSearchSelection()
 
         if self.ui.textEdit_search.toPlainText() == "":
             logging.info(f"{self.getCurrentTime()}: Search input field is empty")
@@ -751,15 +898,15 @@ class MONAILabelReviewerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
         notFoundIdList = [id for id in idList if (id not in foundIdList)]
         self.loadSearchImageMetaInTable(self.listImageData, notFoundIdList)
 
-        self.ui.collapsibleButton_dicom_evaluation.enabled = True
         self.setHorizontalSlider(len(foundIdList))
         if len(foundIdList) > 0:
             self.setSearchResultMessage(numOfFound=len(foundIdList))
-            self.loadFirstImage()
+            # Results are displayed first; Show loads the selected series.
         else:
             self.setSearchResultMessage(numOfFound=0)
 
     def searchByAnnotatorReviewer(self):
+        self.resetSearchSelection()
         selectedAnnotator: str = self.ui.comboBox_search_annotator.currentText
         selectedReviewer: str = self.ui.comboBox_search_reviewer.currentText
         isApproved: bool = bool(self.ui.checkBox_search_approved.isChecked())
@@ -775,14 +922,15 @@ class MONAILabelReviewerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
 
         self.loadSearchImageMetaInTable(self.listImageData, [])
         if len(self.listImageData) > 0:
-            self.ui.collapsibleButton_dicom_evaluation.enabled = True
             self.setSearchResultMessage(numOfFound=len(self.idToimageData))
             self.setHorizontalSlider(len(self.idToimageData))
-            self.loadFirstImage()
+            # The user opens a chosen series with Show; searching must not
+            # download an MRI or segmentation automatically.
         else:
             self.setSearchResultMessage(numOfFound=0)
 
     def searchByLevel(self):
+        self.resetSearchSelection()
         isEasy: bool = bool(self.ui.checkBox_search_easy.isChecked())
         isMedium: bool = bool(self.ui.checkBox_search_medium.isChecked())
         isHard: bool = bool(self.ui.checkBox_search_hard.isChecked())
@@ -792,10 +940,9 @@ class MONAILabelReviewerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
 
         self.loadSearchImageMetaInTable(self.listImageData, [])
         if len(self.listImageData) > 0:
-            self.ui.collapsibleButton_dicom_evaluation.enabled = True
             self.setSearchResultMessage(numOfFound=len(self.idToimageData))
             self.setHorizontalSlider(len(self.idToimageData))
-            self.loadFirstImage()
+            # Loading a series is an explicit action via Show.
         else:
             self.setSearchResultMessage(numOfFound=0)
 
@@ -826,6 +973,7 @@ class MONAILabelReviewerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
             notFoundIdList (list): list contains not found ids
         """
         rowCount = len(foundlist) + len(notFoundIdList)
+        self.ui.tableWidge_imageMeta.setSortingEnabled(False)
         self.ui.tableWidge_imageMeta.setRowCount(rowCount)
         rowCounter = 0
         for row, imageData in enumerate(foundlist):
@@ -840,13 +988,17 @@ class MONAILabelReviewerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
             self.ui.tableWidge_imageMeta.setItem(rowCounter, 2, qt.QTableWidgetItem("No"))
             rowCounter += 1
 
-        self.ui.btn_show_image.enabled = True
+        self.ui.btn_show_image.enabled = bool(foundlist)
+        self.ui.tableWidge_imageMeta.setSortingEnabled(True)
 
     def loadFirstImage(self):
         self.imageCounter = 0
         self.currentImageData = self.listImageData[self.imageCounter]
-        self.loadNextImage(self.currentImageData)
-        self.updateHorizontalSlider()
+        loaded = self.loadNextImage(self.currentImageData)
+        self.ui.collapsibleButton_dicom_evaluation.enabled = loaded
+        if loaded:
+            self.setHorizontalSlider(len(self.listImageData))
+            self.updateHorizontalSlider()
 
     def showSearchedImage(self):
         """
@@ -862,7 +1014,12 @@ class MONAILabelReviewerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
             logging.info(f"{self.getCurrentTime()}: Selected image id [id = {selectedImageId}] was not found")
             return
         self.currentImageData = self.idToimageData[selectedImageId]
-        self.loadNextImage(self.currentImageData)
+        self.imageCounter = self.listImageData.index(self.currentImageData)
+        loaded = self.loadNextImage(self.currentImageData)
+        self.ui.collapsibleButton_dicom_evaluation.enabled = loaded
+        if loaded:
+            self.setHorizontalSlider(len(self.listImageData))
+            self.updateHorizontalSlider()
 
     def removeAllWhiteSpaces(self, strChain) -> str:
         """
@@ -1080,7 +1237,20 @@ class MONAILabelReviewerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
         """
         Sends the updated meta data of dicom and segmentation to monai-server
         Monai-server incorporates that information into datastore.json file
+
+        Only explicit reviewer changes (approve/flag, level, comment) in
+        Reviewer mode are sent.  Navigating with Next must not write
+        anything to the server datastore.
         """
+        if self.currentImageData is None:
+            return
+        if not self.reviewersModeIsActive:
+            logging.info("Review meta not sent: Basic mode is read-only for the datastore")
+            return
+        currentMeta = (self.getCurrentMetaStatus(), self.getCurrentMetaLevel(), self.getCurrentComment())
+        if currentMeta == self._loadedReviewMeta:
+            logging.info("Review meta not sent: no reviewer changes for '%s'", self.currentImageData.getName())
+            return
         self.logic.updateLabelInfo(
             imageData=self.currentImageData,
             versionTag=self.getCurrentLabelVersion(),
@@ -1136,6 +1306,9 @@ class MONAILabelReviewerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
         self.setMetaButtonsAccordingToImageData(imageData, currentLabelVersion)
 
         self.setCurrentMetaLevel(level=imageData.getLevel(currentLabelVersion))
+        # Snapshot of the review meta as loaded from the server; Next only
+        # persists when the reviewer changed something explicitly.
+        self._loadedReviewMeta = (self.getCurrentMetaStatus(), self.getCurrentMetaLevel(), self.getCurrentComment())
 
     def setMetaButtonsAccordingToImageData(self, imageData: ImageData, currentLabelVersion: str):
         finalLevel = imageData.getLevel(currentLabelVersion)
@@ -1149,14 +1322,14 @@ class MONAILabelReviewerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
             self.activateBtnApproved(False)
 
     def fillLineEditsWithSegmenationMeta(self, imageData: ImageData, currentLabelVersion: str):
-        logging.info(f"==== currentLabelVersion: {currentLabelVersion}")
-        logging.info(f"==== getName: {imageData.getName()}")
-        logging.info(f"==== getClientId: {imageData.getClientId(currentLabelVersion)}")
-        logging.info(f"==== getTime: {imageData.getTimeOfAnnotation()}")
-        logging.info(f"==== getStatus: {imageData.getStatus(currentLabelVersion)}")
-        logging.info(f"==== getComment: {imageData.getComment(currentLabelVersion)}")
-        logging.info(f"==== getLevel: {imageData.getLevel(currentLabelVersion)}")
-        logging.info(f"==== edtitingTme: {imageData.getTimeOfEditing(currentLabelVersion)}")
+        logging.debug(f"==== currentLabelVersion: {currentLabelVersion}")
+        logging.debug(f"==== getName: {imageData.getName()}")
+        logging.debug(f"==== getClientId: {imageData.getClientId(currentLabelVersion)}")
+        logging.debug(f"==== getTime: {imageData.getTimeOfAnnotation()}")
+        logging.debug(f"==== getStatus: {imageData.getStatus(currentLabelVersion)}")
+        logging.debug(f"==== getComment: {imageData.getComment(currentLabelVersion)}")
+        logging.debug(f"==== getLevel: {imageData.getLevel(currentLabelVersion)}")
+        logging.debug(f"==== edtitingTme: {imageData.getTimeOfEditing(currentLabelVersion)}")
 
         name = imageData.getName()
         annotator = imageData.getClientId(currentLabelVersion)
@@ -1240,25 +1413,69 @@ class MONAILabelReviewerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
                                 which is required for rest request to monai server
                                 in order to get dicom and segmenation (.nrrd).
         """
+        self.currentImageData = imageData
+        self._seriesLoaded = False
+        self.updateSectionAvailability()
         slicer.mrmlScene.Clear()
         self.clearInformationFields()
 
         if tag == "":
-            tag = self.currentImageData.getApprovedVersionTagElseReturnLatestVersion()
+            tag = imageData.getApprovedVersionTagElseReturnLatestVersion()
         if tag == "":
             tag = self.getCurrentLabelVersion()
-        logging.warn(f"{self.getCurrentTime()} Loading image (id='{imageData.getName()}', tag='{tag}')")
+        logging.debug(f"{self.getCurrentTime()} Loading image (id='{imageData.getName()}', tag='{tag}')")
         self.disableDifficultyButtons(tag=tag)
         self.displayImageMetaData(imageData, tag)
 
-        self.logic.loadDicomAndSegmentation(imageData, tag)
+        try:
+            self.logic.loadDicomAndSegmentation(imageData, tag)
+            _schemaNode = self.logic.ensureProjectSegmentSchema()
+            # Reviewer's mode can refresh the Segment Editor after loading;
+            # re-assert visibility so the label remains visible in 2D too.
+            self.logic.ensureAllSegmentationViewsVisible()
+            try:
+                _segNode = _schemaNode or getattr(self.logic, "_lastSegmentationNode", None)
+                if _segNode is not None and _segNode.GetScene() is None:
+                    _segNode = None
+                self._lastSegmentationNode = _segNode
+                self._segmentsTable.setSegmentationNode(None)
+                self._segmentsTable.setSegmentationNode(_segNode)
+            except Exception:
+                logging.exception("Could not show segment list")
+        except Exception as exception:
+            logging.exception(
+                "%s: Failed to load selected series '%s'", self.getCurrentTime(), imageData.getName()
+            )
+            slicer.util.warningDisplay(
+                "Не удалось загрузить выбранную серию или маску. "
+                "Серия оставлена в списке; проверьте Python Console.\n\n"
+                f"{exception}"
+            )
+            self._seriesLoaded = False
+            self.updateSectionAvailability()
+            return False
 
-        if imageData.getStatus() != self.STATUS.NOT_SEGMENTED:
-            self.displayLabelOfSegmentation()
+        serverUrl = self.logic.getServerUrl().rstrip("/").lower()
+        isShoulderProject = (
+            serverUrl.endswith(":8103")
+            or serverUrl.endswith(":8104")
+            or "/monai/task04" in serverUrl
+            or "/monai/task05" in serverUrl
+        )
+        if imageData.getStatus() != self.STATUS.NOT_SEGMENTED or isShoulderProject:
+            # Do not bind the embedded Segment Editor while a series is being
+            # loaded.  In Slicer 5.12, assigning a large segmentation to the
+            # editor during this path can block the GUI thread indefinitely.
+            # The MRI and segmentation are already displayed above; the
+            # editor is attached when the user explicitly starts editing.
+            pass
 
-        if self.currentImageId is not imageData.getName():
+        if self.currentImageId != imageData.getName():
             self.currentImageId = imageData.getName()
             self.fillComboBoxLabelVersions(imageData)
+        self._seriesLoaded = True
+        self.updateSectionAvailability()
+        return True
 
     def fillComboBoxLabelVersions(self, imageData: ImageData):
         self.isSelectableByLabelVersion = False
@@ -1303,6 +1520,26 @@ class MONAILabelReviewerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
     def displayEditorTools(self):
         isCheckedForEdit = self.ui.btn_edit_label.isChecked()
         if isCheckedForEdit:
+            if not getattr(self, "_seriesLoaded", False) or self.currentImageData is None:
+                self.ui.btn_edit_label.setChecked(False)
+                slicer.util.warningDisplay("Сначала загрузите конкретную серию и её маску.")
+                return
+            try:
+                # The embedded qMRMLSegmentEditorWidget is unsafe for this
+                # project's multi-segment labels in Slicer 5.12: attaching
+                # the segmentation can block the GUI thread.  Use Slicer's
+                # maintained Segment Editor module instead.  It attaches the
+                # same MRML segmentation and source volume through its own
+                # supported lifecycle.  Only MRML references are set here
+                # (no Qt widget binding), then the module is opened.
+                self._prepareStandardSegmentEditor()
+                slicer.util.selectModule("SegmentEditor")
+            except Exception as exception:
+                logging.exception("Could not open standard Segment Editor")
+                self.ui.btn_edit_label.setChecked(False)
+                slicer.util.warningDisplay(f"Не удалось открыть стандартный редактор сегментации:\n{exception}")
+                return
+            self._showBackToReviewerButton(True)
             self.clearButtons()
             self.ui.btn_edit_label.setText("Reset current label edit")
             self.cleanLineEditsContainingSegMetaWhenStartEditing()
@@ -1347,7 +1584,61 @@ class MONAILabelReviewerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
         self.ui.btn_mark_revision.enabled = False
         self.ui.btn_approved.enabled = False
 
+    def _showBackToReviewerButton(self, visible: bool):
+        """Button at the top of Segment Editor that returns to the Reviewer."""
+        try:
+            button = getattr(self, "_backToReviewerButton", None)
+            if button is None:
+                if not visible:
+                    return
+                editorPanel = slicer.modules.segmenteditor.widgetRepresentation()
+                button = qt.QPushButton("\u2b05 Вернуться в MONAI Reviewer (сохранить правку)")
+                button.setStyleSheet("background-color: rgb(118, 214, 255); font-weight: bold; padding: 6px;")
+                button.clicked.connect(lambda: slicer.util.selectModule("MONAILabelReviewer"))
+                editorPanel.layout().insertWidget(0, button)
+                self._backToReviewerButton = button
+            button.setVisible(visible)
+        except Exception:
+            logging.exception("Could not add back-to-Reviewer button")
+
+    def _currentSegmentationNode(self):
+        node = getattr(self, "_lastSegmentationNode", None)
+        if node is not None and node.GetScene() is not None:
+            return node
+        return slicer.mrmlScene.GetFirstNodeByClass("vtkMRMLSegmentationNode")
+
+    def _prepareStandardSegmentEditor(self):
+        """Point the standard Segment Editor at the current series' nodes."""
+        segmentationNode = self._currentSegmentationNode()
+        sourceVolumeNode = getattr(self.logic, "_lastSourceVolumeNode", None)
+        if sourceVolumeNode is not None and sourceVolumeNode.GetScene() is None:
+            sourceVolumeNode = None
+        parameterNode = self.selectParameterNode(bindToWidget=False)
+        if segmentationNode is not None:
+            parameterNode.SetAndObserveSegmentationNode(segmentationNode)
+        if sourceVolumeNode is not None:
+            parameterNode.SetAndObserveSourceVolumeNode(sourceVolumeNode)
+
+    def onBuild3DSurfaces(self):
+        """Explicit, separate 3D operation for the current series."""
+        node = self._currentSegmentationNode()
+        if node is None or not getattr(self, "_seriesLoaded", False):
+            slicer.util.warningDisplay("Сначала загрузите серию с маской.")
+            return
+        self._build3DButton.enabled = False
+        try:
+            self.logic.buildClosedSurface(node)
+        finally:
+            self._build3DButton.enabled = True
+
+    def _closeEmbeddedEditor(self):
+        table = getattr(self, "_segmentsTable", None)
+        if table is not None:
+            table.show()
+
     def deactivatedEditorTools(self):
+        self._showBackToReviewerButton(False)
+        self._closeEmbeddedEditor()
         self.activateSegmentatorEditor(activated=False)
         self.ui.btn_save_new_version.setChecked(False)
         self.ui.btn_overwrite_version.setChecked(False)
@@ -1383,16 +1674,37 @@ class MONAILabelReviewerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
     # Section: Display label
     def addSegmentator(self):
         self.segmentEditorWidget.setMRMLScene(slicer.mrmlScene)
-        self.selectParameterNode()
+        # Keep the widget unbound until the user explicitly starts editing.
+        # Binding an empty parameter node here makes later scene replacement
+        # recurse through the Qt selectors and can freeze Slicer 5.12.
+        self.selectParameterNode(bindToWidget=False)
         self.segmentEditorWidget.setEffectNameOrder([])
 
     def displayLabelOfSegmentation(self):
-        self.selectParameterNode()
-        self.getDefaultSourceVolumeNodeID()
-        self.segmentEditorWidget.SegmentationNodeComboBox.setCurrentNodeIndex(0)
-        self.segmentEditorWidget.SourceVolumeNodeComboBox.setCurrentNodeIndex(0)
+        # Configure the parameter node before attaching it to the Qt widget.
+        # Attaching an empty node first and then changing its references caused
+        # recursive widget updates and froze Slicer 5.12.
+        segmentEditorNode = self.selectParameterNode(bindToWidget=False)
+        segmentationNode = self._currentSegmentationNode()
+        if segmentationNode is None:
+            raise RuntimeError("Segmentation node was not created")
+        # Bind MRML nodes directly. Changing the embedded Qt node selector
+        # recursively invoked its currentNodeChanged callback in Slicer 5.12
+        # and froze the main thread on large segmentations.
+        segmentEditorNode.SetAndObserveSegmentationNode(segmentationNode)
+        sourceVolumeNode = getattr(self.logic, "_lastSourceVolumeNode", None)
+        if sourceVolumeNode is not None and sourceVolumeNode.GetScene() is None:
+            sourceVolumeNode = None
+        if sourceVolumeNode is not None:
+            segmentEditorNode.SetAndObserveSourceVolumeNode(sourceVolumeNode)
+        else:
+            pass
+        self.segmentEditorWidget.setMRMLSegmentEditorNode(segmentEditorNode)
+        self._parameterNode = segmentEditorNode
+        self.segmentEditorWidget.updateWidgetFromMRML()
+        return segmentEditorNode
 
-    def selectParameterNode(self):
+    def selectParameterNode(self, bindToWidget=True):
         # Select parameter set node if one is found in the scene, and create one otherwise
         segmentEditorSingletonTag = "SegmentEditor"
         segmentEditorNode = slicer.mrmlScene.GetSingletonNode(segmentEditorSingletonTag, "vtkMRMLSegmentEditorNode")
@@ -1401,7 +1713,10 @@ class MONAILabelReviewerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
             segmentEditorNode.UnRegister(None)
             segmentEditorNode.SetSingletonTag(segmentEditorSingletonTag)
             segmentEditorNode = slicer.mrmlScene.AddNode(segmentEditorNode)
-        self.segmentEditorWidget.setMRMLSegmentEditorNode(segmentEditorNode)
+        if bindToWidget:
+            self.segmentEditorWidget.setMRMLSegmentEditorNode(segmentEditorNode)
+            self._parameterNode = segmentEditorNode
+        return segmentEditorNode
 
     def getDefaultSourceVolumeNodeID(self):
         layoutManager = slicer.app.layoutManager()
@@ -1436,7 +1751,15 @@ class MONAILabelReviewerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
             comment=self.getCurrentComment(),
         )
 
-        segmentationNode = self.segmentEditorWidget.segmentationNode()
+        segmentationNode = None
+        try:
+            segmentationNode = self._currentSegmentationNode() or self.segmentEditorWidget.segmentationNode()
+        except Exception:
+            logging.exception("Embedded Segment Editor has no active segmentation")
+        if segmentationNode is None:
+            segmentationNode = slicer.mrmlScene.GetFirstNodeByClass("vtkMRMLSegmentationNode")
+        if segmentationNode is None:
+            raise RuntimeError("Не найдена сегментация для сохранения")
         self.tmpdir = slicer.util.tempDirectory("slicer-monai-reviewer")
         label_in = tempfile.NamedTemporaryFile(suffix=".nrrd", dir=self.tmpdir).name
         slicer.util.saveNode(segmentationNode, label_in)
@@ -1546,6 +1869,7 @@ class MONAILabelReviewerLogic(ScriptedLoadableModuleLogic):
         ScriptedLoadableModuleLogic.__init__(self)
         self.temp_dir = None
         self.imageDataController: ImageDataController = ImageDataController()
+        self._lastSourceVolumeNode = None
 
     # Section: Server
     def getServerUrl(self) -> str:
@@ -1681,10 +2005,32 @@ class MONAILabelReviewerLogic(ScriptedLoadableModuleLogic):
         if imageData.isSegemented():
             segmentationFileName = imageData.getSegmentationFileName()
             img_blob = self.imageDataController.reuqestSegmentation(image_id, tag)
+            if img_blob is None or getattr(img_blob, "status_code", None) != 200:
+                logging.warning(
+                    "Mask check '%s' tag=%s: HTTP %s - no mask imported, MRI kept",
+                    image_id, tag, getattr(img_blob, "status_code", None),
+                )
+                return
             destination = self.storeSegmentation(img_blob, segmentationFileName, self.temp_dir.name)
-            self.displaySegmention(destination)
-            os.remove(destination)
-            logging.info(f"{self.getCurrentTime()}: Removed file at {destination}")
+            if destination and os.path.isfile(destination):
+                nonzero, dims = self.countNrrdNonzeroVoxels(destination)
+                logging.info(
+                    "Mask check '%s' tag=%s: HTTP %s, %s bytes, NRRD dims=%s, nonzero voxels=%s",
+                    image_id, tag, img_blob.status_code, len(img_blob.content), dims, nonzero,
+                )
+                if nonzero == 0:
+                    logging.warning("Mask '%s' tag=%s has no nonzero voxels on the server", image_id, tag)
+                segmentationNode = self.displaySegmention(destination)
+                os.remove(destination)
+                summary = self.summarizeSegmentation(segmentationNode)
+                if summary:
+                    logging.info(
+                        "Segmentation '%s': %s segments, %s non-empty, labelmap dims=%s, scalar range=%s",
+                        image_id, summary["segments"], summary["nonEmptySegments"],
+                        summary["labelmapDims"], summary["scalarRange"],
+                    )
+        else:
+            logging.warning("%s: datastore entry has no usable label version for tag=%s", self.getCurrentTime(), tag)
 
     def storeSegmentation(
         self, response: requests.models.Response, segmentationFileName: str, tempDirectory: str
@@ -1702,6 +2048,83 @@ class MONAILabelReviewerLogic(ScriptedLoadableModuleLogic):
         logging.info(f"{self.getCurrentTime()}: Image segmentation is stored temoparily in: {destination}")
         return destination
 
+    def countNrrdNonzeroVoxels(self, path: str):
+        """Return (nonzero voxel count, dims) of a downloaded label file, or (None, None)."""
+        try:
+            import numpy as np
+            import SimpleITK as sitk
+
+            image = sitk.ReadImage(path)
+            array = sitk.GetArrayViewFromImage(image)
+            return int(np.count_nonzero(array)), tuple(image.GetSize())
+        except Exception:
+            logging.exception("Could not read downloaded mask for voxel check")
+            return None, None
+
+    @staticmethod
+    def segmentVoxelCount(segment, binaryName=None):
+        """Number of voxels that really belong to the segment (shared labelmaps aware)."""
+        import numpy as np
+        from vtk.util import numpy_support
+
+        if binaryName is None:
+            binaryName = slicer.vtkSegmentationConverter.GetSegmentationBinaryLabelmapRepresentationName()
+        representation = segment.GetRepresentation(binaryName) if segment is not None else None
+        if representation is None or representation.GetPointData() is None:
+            return 0
+        dims = representation.GetDimensions()
+        if min(dims) <= 0:
+            return 0
+        scalars = representation.GetPointData().GetScalars()
+        if scalars is None:
+            return 0
+        array = numpy_support.vtk_to_numpy(scalars)
+        labelValue = segment.GetLabelValue() if hasattr(segment, "GetLabelValue") else 1
+        return int(np.count_nonzero(array == labelValue))
+
+    @staticmethod
+    def isUsableLabelmap(imageData):
+        """Point 7: reject empty resampling results."""
+        if imageData is None:
+            return False, "no image"
+        dims = imageData.GetDimensions()
+        if min(dims) <= 0:
+            return False, f"zero dims {dims}"
+        scalarRange = imageData.GetScalarRange()
+        if scalarRange[0] == 0.0 and scalarRange[1] == 0.0:
+            return False, "scalar range (0.0, 0.0)"
+        import numpy as np
+        from vtk.util import numpy_support
+
+        scalars = imageData.GetPointData().GetScalars() if imageData.GetPointData() else None
+        if scalars is None or np.count_nonzero(numpy_support.vtk_to_numpy(scalars)) == 0:
+            return False, "no nonzero voxels"
+        return True, ""
+
+    def summarizeSegmentation(self, segmentationNode):
+        """Real voxel-based summary (segment names alone prove nothing)."""
+        if segmentationNode is None or segmentationNode.GetScene() is None:
+            return None
+        binaryName = slicer.vtkSegmentationConverter.GetSegmentationBinaryLabelmapRepresentationName()
+        segmentation = segmentationNode.GetSegmentation()
+        perSegment = {}
+        dims = None
+        scalarRange = None
+        for index in range(segmentation.GetNumberOfSegments()):
+            segment = segmentation.GetNthSegment(index)
+            perSegment[segment.GetName()] = self.segmentVoxelCount(segment, binaryName)
+            representation = segment.GetRepresentation(binaryName)
+            if representation is not None and perSegment[segment.GetName()] > 0 and dims is None:
+                dims = tuple(representation.GetDimensions())
+                scalarRange = tuple(representation.GetScalarRange())
+        return {
+            "segments": segmentation.GetNumberOfSegments(),
+            "nonEmptySegments": sum(1 for count in perSegment.values() if count > 0),
+            "voxelsPerSegment": perSegment,
+            "labelmapDims": dims,
+            "scalarRange": scalarRange,
+        }
+
     def getPathToStore(self, segmentationFileName: str, tempDirectory: str) -> str:
         return tempDirectory + "/" + segmentationFileName
 
@@ -1710,10 +2133,341 @@ class MONAILabelReviewerLogic(ScriptedLoadableModuleLogic):
         Displays the segmentation in slicer window
         """
         segmentation = slicer.util.loadSegmentation(destination)
+        if segmentation is None:
+            logging.warning("%s: Segmentation node was not created", self.getCurrentTime())
+            return None
+        sourceVolumeNode = self._lastSourceVolumeNode
+        if sourceVolumeNode is not None and sourceVolumeNode.GetScene() is None:
+            sourceVolumeNode = None
+        if sourceVolumeNode is not None:
+            self.alignSegmentationToSourceVolume(segmentation, sourceVolumeNode)
+        else:
+            logging.warning("Current series MRI is unknown; mask kept in its own geometry (not aligned)")
+        self._configureSegmentationDisplay(segmentation)
+        self._lastSegmentationNode = segmentation
+        return segmentation
+
+    def alignSegmentationToSourceVolume(self, segmentationNode, sourceVolumeNode):
+        """Resample loaded labelmaps into the MRI RAS/IJK geometry in memory.
+
+        Some MONAI datastore labelmaps use a different axis order/sign
+        convention than the NIfTI MRI.  They can therefore appear in 3D but
+        miss every 2D slice.  Exporting each segment to the source-volume
+        reference geometry with nearest-neighbor interpolation preserves the
+        discrete labels and does not modify the server response or datastore.
+        """
+        if segmentationNode is None or sourceVolumeNode is None:
+            return False
+
+        self._fixMirroredLpsSegmentation(segmentationNode, sourceVolumeNode)
+        segmentation = segmentationNode.GetSegmentation()
+        binaryName = slicer.vtkSegmentationConverter.GetSegmentationBinaryLabelmapRepresentationName()
+        segmentInfos = []
+        segmentIds = vtk.vtkStringArray()
+        segmentation.GetSegmentIDs(segmentIds)
+        for index in range(segmentIds.GetNumberOfValues()):
+            segmentId = segmentIds.GetValue(index)
+            segment = segmentation.GetSegment(segmentId)
+            hasVoxels = self.segmentVoxelCount(segment, binaryName) > 0
+            segmentInfos.append((segmentId, segment.GetName(), segment.GetColor(), hasVoxels))
+
+        nonEmpty = [info for info in segmentInfos if info[3]]
+        if not nonEmpty:
+            segmentationNode.SetReferenceImageGeometryParameterFromVolumeNode(sourceVolumeNode)
+            return False
+
+        logic = slicer.modules.segmentations.logic()
+        alignedSegments = []
+        for segmentId, segmentName, segmentColor, hasVoxels in nonEmpty:
+            oneSegmentIds = vtk.vtkStringArray()
+            oneSegmentIds.InsertNextValue(segmentId)
+            labelmapNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLLabelMapVolumeNode")
+            try:
+                exported = logic.ExportSegmentsToLabelmapNode(
+                    segmentationNode,
+                    oneSegmentIds,
+                    labelmapNode,
+                    sourceVolumeNode,
+                    slicer.vtkSegmentation.EXTENT_REFERENCE_GEOMETRY,
+                )
+                if not exported or labelmapNode.GetImageData() is None:
+                    logging.warning("Could not align segment '%s' to MRI geometry; preserving original segment", segmentName)
+                    continue
+                usable, reason = self.isUsableLabelmap(labelmapNode.GetImageData())
+                if not usable:
+                    logging.warning(
+                        "Alignment result for '%s' rejected (%s); preserving original segment",
+                        segmentName, reason,
+                    )
+                    continue
+
+                alignedImage = slicer.vtkOrientedImageData()
+                alignedImage.DeepCopy(labelmapNode.GetImageData())
+                imageToWorld = vtk.vtkMatrix4x4()
+                labelmapNode.GetIJKToRASMatrix(imageToWorld)
+                alignedImage.SetImageToWorldMatrix(imageToWorld)
+
+                alignedSegment = vtkSegmentationCore.vtkSegment()
+                alignedSegment.SetName(segmentName)
+                alignedSegment.SetColor(*segmentColor)
+                alignedSegment.AddRepresentation(binaryName, alignedImage)
+                alignedSegments.append((segmentId, alignedSegment))
+            finally:
+                slicer.mrmlScene.RemoveNode(labelmapNode)
+
+        if not alignedSegments:
+            logging.warning("No usable alignment result; original mask kept unchanged")
+            return False
+
+        # Replace only segments whose aligned result is valid; every other
+        # segment (including failed/empty alignments) stays untouched.
+        for segmentId, alignedSegment in alignedSegments:
+            orderedIds = list(segmentation.GetSegmentIDs())
+            position = orderedIds.index(segmentId)
+            insertBefore = orderedIds[position + 1] if position + 1 < len(orderedIds) else ""
+            segmentation.RemoveSegment(segmentId)
+            segmentation.AddSegment(alignedSegment, segmentId, insertBefore)
+
+        segmentationNode.SetReferenceImageGeometryParameterFromVolumeNode(sourceVolumeNode)
+        logging.info(
+            "Aligned %s non-empty segments to source MRI geometry (%s)",
+            len(alignedSegments),
+            sourceVolumeNode.GetName(),
+        )
+        return True
+
+    def _fixMirroredLpsSegmentation(self, segmentationNode, sourceVolumeNode):
+        """Labels saved in LPS but read as RAS land mirrored in X and Y.
+
+        If the segmentation RAS bounds equal the source volume bounds with
+        X and Y negated, harden a diag(-1,-1,1) transform into it.
+        """
+        try:
+            vb = [0.0] * 6
+            sb = [0.0] * 6
+            sourceVolumeNode.GetRASBounds(vb)
+            segmentationNode.GetRASBounds(sb)
+            if sb[0] > sb[1]:
+                return False
+
+            def close(a, b):
+                return abs(a - b) <= max(2.0, 0.02 * (abs(a) + abs(b)))
+
+            overlapsX = sb[0] < vb[1] and sb[1] > vb[0]
+            overlapsY = sb[2] < vb[3] and sb[3] > vb[2]
+            mirrored = (
+                close(sb[0], -vb[1]) and close(sb[1], -vb[0])
+                and close(sb[2], -vb[3]) and close(sb[3], -vb[2])
+            )
+            if not mirrored or (overlapsX and overlapsY and close(sb[0], vb[0])):
+                return False
+            flip = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLLinearTransformNode", "MONAI_LPS_to_RAS")
+            matrix = vtk.vtkMatrix4x4()
+            matrix.SetElement(0, 0, -1)
+            matrix.SetElement(1, 1, -1)
+            flip.SetMatrixTransformToParent(matrix)
+            segmentationNode.SetAndObserveTransformNodeID(flip.GetID())
+            slicer.vtkSlicerTransformLogic().hardenTransform(segmentationNode)
+            slicer.mrmlScene.RemoveNode(flip)
+            return True
+        except Exception:
+            logging.exception("LPS mirror check failed")
+            return False
+    def _configureSegmentationDisplay(self, segmentation):
+        """Enable binary-labelmap overlays and per-segment visibility."""
+        if segmentation is None:
+            return
+        try:
+            if hasattr(segmentation, "CreateBinaryLabelmapRepresentation"):
+                segmentation.CreateBinaryLabelmapRepresentation()
+        except Exception:
+            logging.exception("Could not create binary labelmap representation")
+
+        if segmentation.GetDisplayNode() is None:
+            segmentation.CreateDefaultDisplayNodes()
+        displayNode = segmentation.GetDisplayNode()
+        if displayNode is None:
+            return
+
+        displayNode.SetVisibility(True)
+        if hasattr(displayNode, "SetVisibility2D"):
+            displayNode.SetVisibility2D(True)
+        if hasattr(displayNode, "SetVisibility2DFill"):
+            displayNode.SetVisibility2DFill(True)
+        if hasattr(displayNode, "SetVisibility2DOutline"):
+            displayNode.SetVisibility2DOutline(True)
+        if hasattr(displayNode, "SetOpacity2DFill"):
+            displayNode.SetOpacity2DFill(0.5)
+        if hasattr(displayNode, "SetOpacity2DOutline"):
+            displayNode.SetOpacity2DOutline(1.0)
+        if hasattr(displayNode, "SetVisibility3D"):
+            displayNode.SetVisibility3D(True)
+
+        # After MONAI Reviewer clears the scene, Slicer 5.12 may leave the
+        # segmentation display node without explicit slice-view bindings.
+        # Bind it to every current slice view so 2D overlays are reliable.
+        if hasattr(displayNode, "RemoveAllViewNodeIDs"):
+            displayNode.RemoveAllViewNodeIDs()
+        for sliceNode in slicer.util.getNodesByClass("vtkMRMLSliceNode") + slicer.util.getNodesByClass("vtkMRMLViewNode"):
+            if hasattr(displayNode, "AddViewNodeID"):
+                displayNode.AddViewNodeID(sliceNode.GetID())
+
+        segmentIds = vtk.vtkStringArray()
+        segmentation.GetSegmentation().GetSegmentIDs(segmentIds)
+        for index in range(segmentIds.GetNumberOfValues()):
+            segmentId = segmentIds.GetValue(index)
+            displayNode.SetSegmentVisibility(segmentId, True)
+            if hasattr(displayNode, "SetSegmentVisibility2DFill"):
+                displayNode.SetSegmentVisibility2DFill(segmentId, True)
+            if hasattr(displayNode, "SetSegmentVisibility2DOutline"):
+                displayNode.SetSegmentVisibility2DOutline(segmentId, True)
+            if hasattr(displayNode, "SetSegmentVisibility3D"):
+                displayNode.SetSegmentVisibility3D(segmentId, True)
+        logging.debug("Segmentation visibility enabled for %s segments", segmentIds.GetNumberOfValues())
+
+    def buildClosedSurface(self, segmentationNode):
+        """Separate, explicit 3D operation. Returns build time in seconds or None."""
+        if segmentationNode is None or segmentationNode.GetScene() is None:
+            return None
+        closedName = slicer.vtkSegmentationConverter.GetSegmentationClosedSurfaceRepresentationName()
+        started = time.monotonic()
+        try:
+            slicer.app.setOverrideCursor(qt.Qt.BusyCursor)
+            if not segmentationNode.GetSegmentation().ContainsRepresentation(closedName):
+                segmentationNode.CreateClosedSurfaceRepresentation()
+            display = segmentationNode.GetDisplayNode()
+            if display is not None:
+                display.SetVisibility3D(True)
+                display.SetPreferredDisplayRepresentationName3D(closedName)
+        except Exception:
+            logging.exception("Could not build 3D surface")
+            return None
+        finally:
+            slicer.app.restoreOverrideCursor()
+        elapsed = time.monotonic() - started
+        logging.info("3D surfaces built in %.1f s", elapsed)
+        return elapsed
+
+    def ensureAllSegmentationViewsVisible(self):
+        """Keep loaded labels visible in both 2D slices and the 3D view."""
+        for segmentation in slicer.util.getNodesByClass("vtkMRMLSegmentationNode"):
+            self._configureSegmentationDisplay(segmentation)
+
+    def ensureProjectSegmentSchema(self):
+        """Create the complete Task04/Task05 segment list without changing masks."""
+        serverUrl = self.getServerUrl().rstrip("/").lower()
+        fullSchemaRgb = [
+            ("bone_humerus", (255, 214, 10)),
+            ("bone_scapula", (255, 160, 20)),
+            ("bone_clavicle", (255, 105, 40)),
+            ("muscle_supraspinatus", (45, 105, 210)),
+            ("muscle_infraspinatus", (46, 160, 90)),
+            ("muscle_subscapularis", (205, 55, 75)),
+            ("muscle_deltoid", (40, 190, 210)),
+            ("muscle_biceps_brachii", (130, 80, 190)),
+            ("muscle_brachialis", (230, 190, 40)),
+            ("muscle_coracobrachialis", (190, 70, 50)),
+            ("muscle_latissimus_dorsi", (70, 180, 150)),
+            ("muscle_pectoralis_major", (220, 100, 180)),
+            ("muscle_teres_major", (100, 130, 220)),
+            ("muscle_teres_minor", (180, 140, 60)),
+            ("muscle_triceps_brachii", (80, 190, 190)),
+        ]
+        if serverUrl.endswith(":8103") or "/monai/task04" in serverUrl:
+            projectName = "Task04"
+            schemaRgb = fullSchemaRgb[:7]
+        elif serverUrl.endswith(":8104") or "/monai/task05" in serverUrl:
+            projectName = "Task05"
+            schemaRgb = fullSchemaRgb
+        else:
+            return None
+        schema = [(name, tuple(channel / 255.0 for channel in rgb)) for name, rgb in schemaRgb]
+
+        segmentationNodes = slicer.util.getNodesByClass("vtkMRMLSegmentationNode")
+        lastNode = getattr(self, "_lastSegmentationNode", None)
+        if lastNode is not None and lastNode.GetScene() is not None:
+            segmentationNode = lastNode
+        elif segmentationNodes:
+            segmentationNode = segmentationNodes[-1]
+        else:
+            segmentationNode = slicer.mrmlScene.AddNewNode("vtkMRMLSegmentationNode", f"{projectName}_Segmentation")
+
+        sourceVolumeNode = getattr(self, "_lastSourceVolumeNode", None)
+        if sourceVolumeNode is not None and sourceVolumeNode.GetScene() is None:
+            sourceVolumeNode = None
+        if sourceVolumeNode is not None and hasattr(segmentationNode, "SetReferenceImageGeometryParameterFromVolumeNode"):
+            segmentationNode.SetReferenceImageGeometryParameterFromVolumeNode(sourceVolumeNode)
+
+        segmentation = segmentationNode.GetSegmentation()
+        # Names follow the server /info labels (label value = position + 1).
+        # Older local builds used names without the "muscle_" prefix; such
+        # segments are matched and renamed instead of creating duplicates.
+        existingSegmentsByName = {}
+        for index in range(segmentation.GetNumberOfSegments()):
+            segment = segmentation.GetNthSegment(index)
+            existingSegmentsByName.setdefault(segment.GetName(), segment)
+        for name, _color in schema:
+            legacyName = name[len("muscle_"):] if name.startswith("muscle_") else None
+            if name not in existingSegmentsByName and legacyName in existingSegmentsByName:
+                segment = existingSegmentsByName.pop(legacyName)
+                segment.SetName(name)
+                existingSegmentsByName[name] = segment
+
+        added = 0
+        for name, color in schema:
+            segment = existingSegmentsByName.get(name)
+            if segment is None:
+                # In the Slicer 5.12 Python wrapper AddEmptySegment(name)
+                # may interpret the argument as an ID and still create a
+                # generic display name.  Create the segment explicitly so
+                # the Segment Editor receives the project name and color.
+                segment = vtkSegmentationCore.vtkSegment()
+                segment.SetName(name)
+                segment.SetColor(*color)
+                segmentation.AddSegment(segment)
+                added += 1
+            if segment is not None:
+                segment.SetColor(*color)
+
+        self._configureSegmentationDisplay(segmentationNode)
+        self._lastSegmentationNode = segmentationNode
+        logging.info("%s schema ensured: %s segments total, %s empty segments added", projectName, len(schema), added)
+        return segmentationNode
+
+    def ensureTask04SegmentSchema(self):
+        """Compatibility alias for earlier local Reviewer builds."""
+        return self.ensureProjectSegmentSchema()
 
     def requestDicomImage(self, image_id: str, image_name: str, node_name: str):
         download_uri = self.imageDataController.getDicomDownloadUri(image_id)
-        SampleData.SampleDataLogic().downloadFromURL(nodeNames=node_name, fileNames=image_name, uris=download_uri)
+        self._lastSourceVolumeNode = None
+        beforeIds = {node.GetID() for node in slicer.util.getNodesByClass("vtkMRMLScalarVolumeNode")}
+        loaded = SampleData.SampleDataLogic().downloadFromURL(nodeNames=node_name, fileNames=image_name, uris=download_uri)
+
+        # Always keep the volume that belongs to the just requested series.
+        # Using GetFirstNodeByClass() is unsafe after reviewing more than one
+        # series because the scene may still contain an older scalar volume.
+        candidates = []
+        if loaded is not None:
+            candidates = loaded if isinstance(loaded, (list, tuple)) else [loaded]
+        candidates += [
+            node for node in slicer.util.getNodesByClass("vtkMRMLScalarVolumeNode")
+            if node.GetID() not in beforeIds
+        ]
+        for node in candidates:
+            if node is not None and hasattr(node, "GetID"):
+                self._lastSourceVolumeNode = node
+                logging.info("Selected current MRI volume for mask alignment: %s", node.GetName())
+                return
+
+        for node in slicer.util.getNodesByClass("vtkMRMLScalarVolumeNode"):
+            if node.GetName() in (node_name, image_name) or node.GetName().startswith(node_name):
+                self._lastSourceVolumeNode = node
+                logging.info("Selected current MRI volume by name for mask alignment: %s", node.GetName())
+                return
+
+        self._lastSourceVolumeNode = None
+        logging.warning("Could not identify the MRI of the current series; mask will not be resampled")
 
     def setTempFolderDir(self):
         """

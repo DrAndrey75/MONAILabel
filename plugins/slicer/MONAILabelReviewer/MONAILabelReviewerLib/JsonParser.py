@@ -36,8 +36,10 @@ class JsonParser:
     def getValueByKey(self, keyArr: List[str], jsonObj: dict):
         if len(keyArr) == 0:
             return ""
+        if not isinstance(jsonObj, dict):
+            return ""
         for key in keyArr:
-            if key not in jsonObj:
+            if not isinstance(jsonObj, dict) or key not in jsonObj:
                 return ""
             jsonObj = jsonObj[key]
         return jsonObj
@@ -64,7 +66,7 @@ class JsonParser:
 
     def hasLabels(self, obj: dict) -> bool:
         lablesSection = self.getValueByKey(self.dataStoreKeys.LABELS, obj)
-        if len(lablesSection) == 0:
+        if not isinstance(lablesSection, dict) or len(lablesSection) == 0:
             return False
         return True
 
@@ -97,9 +99,14 @@ class JsonParser:
         return list(labelsDict.keys())
 
     def extractLabelContentByName(self, labels: dict, labelName="final") -> Dict[str, str]:
-        if labelName not in labels:
+        if not isinstance(labels, dict) or labelName not in labels:
             return {}
-        content = labels[labelName][self.dataStoreKeys.INFO]
+        label = labels.get(labelName)
+        if not isinstance(label, dict):
+            return {}
+        content = label.get(self.dataStoreKeys.INFO)
+        if not isinstance(content, dict):
+            return {}
 
         if self.dataStoreKeys.LABEL_INFO not in content:
             return {}
@@ -109,9 +116,14 @@ class JsonParser:
         return labelDict
 
     def extractSegmentationMetaOfVersion(self, labels: dict, labelName: str) -> dict:
-        if labelName not in labels:
+        if not isinstance(labels, dict) or labelName not in labels:
             return {}
-        content = labels[labelName][self.dataStoreKeys.INFO]
+        label = labels.get(labelName)
+        if not isinstance(label, dict):
+            return {}
+        content = label.get(self.dataStoreKeys.INFO)
+        if not isinstance(content, dict):
+            return {}
 
         if self.dataStoreKeys.META not in content:
             return {}
@@ -134,11 +146,11 @@ class JsonParser:
     def produceSegementationData(self, segmenatationDict: dict) -> SegmentationMeta:
         segmentationMeta = SegmentationMeta()
         segmentationMeta.build(
-            status=segmenatationDict[self.dataStoreKeys.META_STATUS],
-            level=segmenatationDict[self.dataStoreKeys.META_LEVEL],
-            approvedBy=segmenatationDict[self.dataStoreKeys.APPROVED_BY],
-            comment=segmenatationDict[self.dataStoreKeys.META_COMMENT],
-            editTime=segmenatationDict[self.dataStoreKeys.META_EDIT_TIME],
+            status=segmenatationDict.get(self.dataStoreKeys.META_STATUS, ""),
+            level=segmenatationDict.get(self.dataStoreKeys.META_LEVEL, ""),
+            approvedBy=segmenatationDict.get(self.dataStoreKeys.APPROVED_BY, ""),
+            comment=segmenatationDict.get(self.dataStoreKeys.META_COMMENT, ""),
+            editTime=segmenatationDict.get(self.dataStoreKeys.META_EDIT_TIME, ""),
         )
 
         return segmentationMeta
@@ -198,8 +210,16 @@ class JsonParser:
         return self.getValueByKey(self.dataStoreKeys.getMetaComment(label), obj)
 
     def parseJsonToImageData(self):
-        objects = self.jsonObject[self.dataStoreKeys.OBJECT]
+        objects = self.jsonObject.get(self.dataStoreKeys.OBJECT, {})
+        if not isinstance(objects, dict):
+            return
         for key, value in objects.items():
+            # Ignore incomplete datastore records instead of crashing the client.
+            if not isinstance(value, dict):
+                continue
+            imageInfo = value.get("image")
+            if not isinstance(imageInfo, dict) or not isinstance(imageInfo.get("info"), dict):
+                continue
             imageData = self.jsonToImageData(key, value)
             self.mapIdToImageData[key] = imageData
 

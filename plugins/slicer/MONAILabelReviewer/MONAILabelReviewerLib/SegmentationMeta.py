@@ -46,7 +46,10 @@ class SegmentationMeta:
         if versionTag == self.LABEL.FINAL or versionTag == self.LABEL.ORIGINAL:
             self.versionNumber = 0
         else:
-            self.versionNumber = self.parsNumberFromVersionTagString(versionTag=versionTag)
+            try:
+                self.versionNumber = self.parsNumberFromVersionTagString(versionTag)
+            except (ValueError, IndexError):
+                self.versionNumber = 0
 
     def parsNumberFromVersionTagString(self, versionTag: str) -> int:
         lastCharIndex = len(versionTag)
@@ -58,8 +61,8 @@ class SegmentationMeta:
         return self.versionNumber
 
     def update(self, status="", level="", approvedBy="", comment="") -> bool:
-        logging.warn("=============== HEER ==============")
-        logging.warn(f"status={status}, level={level}, approvedBy={approvedBy}, comment={comment}")
+        logging.debug("SegmentationMeta.update")
+        logging.debug(f"status={status}, level={level}, approvedBy={approvedBy}, comment={comment}")
         isChanged = False
         if self.isBlank(status) is False and status != self.status:
             self.status = status
