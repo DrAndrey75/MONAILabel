@@ -96,10 +96,11 @@ class ImageDataExtractor:
         return len(self.idsOfNotSegmented)
 
     def getNumOfSegmented(self) -> int:
-        count = 0
-        for idList in self.clientToImageIds.values():
-            count += len(idList)
-        return count
+        # A datastore entry can contain a valid final/original label without
+        # having a reviewer/annotator client_id (for example Task05 machine
+        # prelabels).  Progress must count the segmentation itself, not only
+        # entries grouped by client_id.
+        return sum(1 for imageData in self.nameToImageData.values() if imageData.isSegemented())
 
     def getSegmentationProgessInPercentage(self) -> int:
         """
