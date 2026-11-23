@@ -319,30 +319,53 @@ class ImageData:
         return tagToSegmentationMetaJson
 
     def getApprovedVersionTagElseReturnLatestVersion(self) -> str:
-        latest = 0
-        latestVersion = ""
+        # Automatic loading policy for the project:
+        #   1) version_2+ -> highest numeric version;
+        #   2) otherwise version_1, if present;
+        #   3) otherwise final, then original;
+        #   4) finally fall back to the highest known version/tag.
+        # Do not rely on JSON/dict insertion order: datastore records may be
+        # returned in a different order after a new version is saved.
+        numericVersions = []
+        for tag in self.versionNames:
+            if not isinstance(tag, str) or not tag.startswith(self.prefixVersion):
+                continue
+            try:
+                numericVersions.append((int(tag[len(self.prefixVersion) :]), tag))
+            except (TypeError, ValueError):
+                continue
 
-        if len(self.segmentationMetaDict) == 1:
-            return [*self.segmentationMetaDict.keys()][0]
+        if numericVersions:
+            numericVersions.sort(key=lambda item: item[0])
+            highestNumber, highestTag = numericVersions[-1]
+            if highestNumber >= 2:
+                return highestTag
+            if any(number == 1 for number, _tag in numericVersions):
+                return next(tag for number, tag in numericVersions if number == 1)
 
-        for tag, segmentationMeta in self.segmentationMetaDict.items():
-            if segmentationMeta.getStatus() == self.STATUS.APPROVED:
-                return tag
+        for fallbackTag in (self.FINAL, self.ORIGIN):
+            if fallbackTag in self.versionNames or fallbackTag in self.segmentationMetaDict:
+                return fallbackTag
 
-            version = segmentationMeta.getVersionNumber()
-
-            if latest < version:
-                latest = version
-                latestVersion = tag
-
-        return latestVersion
+        if numericVersions:
+            return numericVersions[-1][1]
+        if self.segmentationMetaDict:
+            return next(iter(self.segmentationMetaDict))
+        return ""
 
     # methods dealing with versions
 
     def getLatestVersionTag(self) -> str:
-        if len(self.versionNames) == 0:
-            return ""
-        return self.versionNames[len(self.versionNames) - 1]
+        numericVersions = []
+        for tag in self.versionNames:
+            if isinstance(tag, str) and tag.startswith(self.prefixVersion):
+                try:
+                    numericVersions.append((int(tag[len(self.prefixVersion) :]), tag))
+                except (TypeError, ValueError):
+                    pass
+        if numericVersions:
+            return max(numericVersions, key=lambda item: item[0])[1]
+        return self.versionNames[-1] if self.versionNames else ""
 
     def getOldestVersion(self) -> str:
         if len(self.versionNames) == 0:

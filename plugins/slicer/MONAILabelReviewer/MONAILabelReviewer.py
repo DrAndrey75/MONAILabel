@@ -1488,7 +1488,10 @@ class MONAILabelReviewerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
                 labelVersion = "{} ({})".format(labelVersion, "approved")
                 approvedVersion = labelVersion
             self.ui.comboBox_label_version.addItem(labelVersion)
-        if approvedVersion != "":
+        preferredVersion = imageData.getApprovedVersionTagElseReturnLatestVersion()
+        if preferredVersion != "":
+            self.setVersionTagInComboBox(preferredVersion, currentImageData=imageData)
+        elif approvedVersion != "":
             self.setVersionTagInComboBox(approvedVersion)
         elif labelVersion != "":
             self.setVersionTagInComboBox(labelVersion)
