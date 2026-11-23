@@ -2419,7 +2419,9 @@ class MONAILabelReviewerLogic(ScriptedLoadableModuleLogic):
         elif segmentationNodes:
             segmentationNode = segmentationNodes[-1]
         else:
-            segmentationNode = slicer.mrmlScene.AddNewNode("vtkMRMLSegmentationNode", f"{projectName}_Segmentation")
+            segmentationNode = slicer.mrmlScene.AddNewNodeByClass(
+                "vtkMRMLSegmentationNode", f"{projectName}_Segmentation"
+            )
 
         sourceVolumeNode = getattr(self, "_lastSourceVolumeNode", None)
         if sourceVolumeNode is not None and sourceVolumeNode.GetScene() is None:
