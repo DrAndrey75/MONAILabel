@@ -1532,8 +1532,12 @@ class MONAILabelReviewerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
                 # same MRML segmentation and source volume through its own
                 # supported lifecycle.  Only MRML references are set here
                 # (no Qt widget binding), then the module is opened.
-                self._prepareStandardSegmentEditor()
                 slicer.util.selectModule("SegmentEditor")
+                # The standard module owns its own qMRMLSegmentEditorWidget.
+                # Attach the current MRI and segmentation after the module
+                # has been activated, rather than only configuring Reviewer's
+                # private parameter node.
+                qt.QTimer.singleShot(0, self._attachStandardSegmentEditor)
             except Exception as exception:
                 logging.exception("Could not open standard Segment Editor")
                 self.ui.btn_edit_label.setChecked(False)
@@ -1547,6 +1551,29 @@ class MONAILabelReviewerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin
         else:
             self.deactivatedEditorTools()
             self.loadNextImage(imageData=self.currentImageData, tag=self.getCurrentLabelVersion())
+
+    def _attachStandardSegmentEditor(self):
+        """Attach the current series to Slicer's real Segment Editor widget."""
+        segmentationNode = self._currentSegmentationNode()
+        sourceVolumeNode = getattr(self.logic, "_lastSourceVolumeNode", None)
+        if segmentationNode is None or segmentationNode.GetScene() is None:
+            raise RuntimeError("Current segmentation node is not available")
+        if sourceVolumeNode is not None and sourceVolumeNode.GetScene() is None:
+            sourceVolumeNode = None
+
+        representation = slicer.modules.segmenteditor.widgetRepresentation()
+        editor = representation.self().editor
+        editor.setMRMLScene(slicer.mrmlScene)
+        editor.setSegmentationNode(segmentationNode)
+        if sourceVolumeNode is not None:
+            editor.setSourceVolumeNode(sourceVolumeNode)
+        editor.setReadOnly(False)
+        editor.updateWidgetFromMRML()
+        logging.info(
+            "EDIT: standard Segment Editor attached segmentation=%s source=%s",
+            segmentationNode.GetName(),
+            sourceVolumeNode.GetName() if sourceVolumeNode is not None else None,
+        )
 
     def cleanLineEditsContainingSegMetaWhenStartEditing(self):
         self.setCurrentMetaStatus(status="")
@@ -2338,7 +2365,9 @@ class MONAILabelReviewerLogic(ScriptedLoadableModuleLogic):
             display = segmentationNode.GetDisplayNode()
             if display is not None:
                 display.SetVisibility3D(True)
-                display.SetPreferredDisplayRepresentationName3D(closedName)
+                # Do not change the preferred representation here. In Slicer
+                # 5.12 that setter can recursively trigger Qt display updates
+                # and cause c00000fd (stack overflow) in Qt5Core.dll.
         except Exception:
             logging.exception("Could not build 3D surface")
             return None
