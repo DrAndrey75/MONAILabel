@@ -343,7 +343,7 @@ class ImageData:
             if any(number == 1 for number, _tag in numericVersions):
                 return next(tag for number, tag in numericVersions if number == 1)
 
-        for fallbackTag in (self.FINAL, self.ORIGIN):
+        for fallbackTag in (self.FINAL, "original", self.ORIGIN):
             if fallbackTag in self.versionNames or fallbackTag in self.segmentationMetaDict:
                 return fallbackTag
 
